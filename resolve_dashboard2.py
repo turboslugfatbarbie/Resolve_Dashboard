@@ -104,6 +104,29 @@ st.set_page_config(
     layout="wide",
 )
 
+BASELINE_SPLIT_MONTH = 0.1
+
+def explain_month_0_vs_0_1():
+    st.sidebar.info(
+        "**Why do I see month 0 vs 0.1?**\n\n"
+        "- **Month 0** = baseline visit.\n"
+        "- **Month 0.1** usually indicates a *baseline split/unscheduled follow-up* recorded shortly after baseline "
+        "(often the next day or within a few days). It's commonly used to keep two baseline-adjacent measurements distinct "
+        "while still sorting them near baseline.\n\n"
+        "If your baseline testing was split over two days, you may want to **merge 0 and 0.1** into a single baseline timepoint."
+    )
+st.sidebar.markdown("## 0) Baseline handling")
+merge_baseline_split = st.sidebar.checkbox(
+    "Merge month 0 and 0.1 into a single baseline timepoint (month 0)",
+    value=True,
+    help="If baseline testing was split across days, this combines month 0 and 0.1 for analysis.",
+)
+explain_month_0_vs_0_1()
+
+# Persist preference
+st.session_state["merge_baseline_split"] = merge_baseline_split
+
+
 # -------------------------------------------------------------------
 # Data intake (Streamlit Cloud-safe): user uploads SAS files
 # -------------------------------------------------------------------
@@ -155,6 +178,52 @@ def sidebar_data_intake():
 # -------------------------------------------------------------------
 # Helpers: export plots & summarize filters
 # -------------------------------------------------------------------
+def merge_month_0_and_0_1(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge baseline split visits by mapping month 0.1 -> 0 and aggregating duplicates per (NewID, month).
+
+    Aggregation:
+      - numeric columns: mean
+      - non-numeric columns: first non-null
+    """
+    if df.empty or "NewID" not in df.columns or "month" not in df.columns:
+        return df
+
+    df2 = df.copy()
+
+    # Map 0.1 -> 0.0 (be robust to float quirks)
+    df2["month"] = pd.to_numeric(df2["month"], errors="coerce")
+    df2.loc[np.isclose(df2["month"].values, BASELINE_SPLIT_MONTH), "month"] = 0.0
+
+    # If this creates duplicates, aggregate them
+    # Build agg dict: numeric mean, non-numeric first non-null
+    numeric_cols = df2.select_dtypes(include=[np.number]).columns.tolist()
+    non_numeric_cols = [c for c in df2.columns if c not in numeric_cols]
+
+    agg = {}
+    for c in numeric_cols:
+        if c in ["month"]:  # month is part of group key; won't be aggregated
+            continue
+        agg[c] = "mean"
+
+    def first_non_null(s: pd.Series):
+        s2 = s.dropna()
+        return s2.iloc[0] if len(s2) else np.nan
+
+    for c in non_numeric_cols:
+        if c in ["NewID", "month"]:
+            continue
+        agg[c] = first_non_null
+
+    out = (
+        df2.groupby(["NewID", "month"], as_index=False)
+           .agg(agg)
+           .sort_values(["NewID", "month"])
+           .reset_index(drop=True)
+    )
+    return out
+
+
 def save_plotly_to_report(fig, label: str, context: str):
     """
     Save a Plotly figure as an HTML snippet into the report.
@@ -525,7 +594,35 @@ if file_bytes is None:
     st.info("Upload the required SAS files in the sidebar to start.")
     st.stop()
 
-df = load_and_merge_data_from_bytes(file_bytes)
+df_raw = load_and_merge_data_from_bytes(file_bytes)
+
+merge_baseline_split = st.session_state.get("merge_baseline_split", True)
+if merge_baseline_split:
+    df = merge_month_0_and_0_1(df_raw)
+else:
+    df = df_raw
+
+##------TOGGLE
+st.title("RESOLVE FSHD Dashboard")
+
+with st.expander("Baseline handling (0 vs 0.1 months)", expanded=False):
+    st.markdown(
+        "- **Month 0** = baseline visit.\n"
+        "- **Month 0.1** = a baseline-adjacent measurement (often a split baseline over two days or an unscheduled near-baseline visit).\n"
+        "If baseline testing was split across days, merging 0 and 0.1 into baseline avoids treating them as separate scheduled timepoints."
+    )
+
+    current = st.session_state.get("merge_baseline_split", True)
+    new_val = st.checkbox(
+        "Merge 0 and 0.1 into baseline (month 0)",
+        value=current,
+        key="merge_toggle_in_app",
+    )
+
+    if new_val != current:
+        st.session_state["merge_baseline_split"] = new_val
+        st.cache_data.clear()  # clears cached merge/load results (safe + simple)
+        st.experimental_rerun()
 
 # ---------- NEW: propagate gender/sex to all visits per patient ----------
 gender_col_for_fill = None
